@@ -163,6 +163,25 @@ class EvaluationTests(unittest.TestCase):
         self.assertFalse(result["usage_complete"])
         agent.assert_called_once()
 
+    def test_interrupted_supervisor_preserves_worker_cost(self):
+        confirmed_cost = self.metrics["budget_cost_usd"]
+        self.metrics = {key: self.metrics[key] for key in ("exit_reason", "model_calls", "budget_cost_usd")}
+
+        def interrupted_supervisor(*args, **kwargs):
+            self.agent(*args, **kwargs)
+            return -9
+
+        with patch.object(verifier, "run_command", side_effect=self.command), \
+             patch.object(swebench, "run_agent", side_effect=interrupted_supervisor):
+            result = swebench.run_case(self.dataset, self.manifest, 0, self.output)
+
+        self.assertEqual(result["agent_returncode"], -9)
+        self.assertIsNone(result["budget_cost_usd"])
+        self.assertEqual(result["known_cost_usd"], confirmed_cost)
+        summary = report.write_report(self.output, manifest=self.manifest)
+        self.assertEqual(summary["known_total_cost_usd"], confirmed_cost)
+        self.assertIsNone(summary["total_cost_usd"])
+
     def test_verifier_timeout_preserves_consumption_and_cleans_resources(self):
         self.verifier_timeout = True
         result, agent = self.evaluate()
@@ -262,6 +281,19 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["model_calls"], 0)
         self.assertEqual(Decimal(result["budget_cost_usd"]), 0)
+        agent.assert_not_called()
+
+    def test_missing_container_limits_saves_setup_error(self):
+        config = self.dataset / "v2/tasks" / self.instance_id / "task.toml"
+        config.write_text(TASK_CONFIG.replace("cpus = 1\n", ""), encoding="utf-8")
+        result, agent = self.evaluate()
+
+        self.assertEqual((result["status"], result["stage"]), ("error", "setup"))
+        self.assertIn("cpus", result["error"])
+        self.assertIsNone(result["resolved"])
+        result_path = self.output / self.instance_id / "agent_result.json"
+        self.assertEqual(json.loads(result_path.read_text(encoding="utf-8")), result)
+        self.assertEqual(self.commands, [])
         agent.assert_not_called()
 
     def test_existing_attempt_is_never_overwritten(self):

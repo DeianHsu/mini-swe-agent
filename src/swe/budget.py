@@ -70,55 +70,64 @@ def run_case(task: str, container: str, workdir: str, output: Path, *,
     })
 
     # 初始化结束状态，并用单调时钟计时，避免系统时间调整影响时限。
+    process = None
     timed_out = False
+    startup_error = None
     cleanup_error = None
     started = time.monotonic()
 
     # 将智能体放入独立 Python 进程，并把标准输出和标准错误合并保存到日志。
-    with (output / "agent.log").open("wb") as log:
-        process = subprocess.Popen(
-            [
-                sys.executable, "-B", "-u", "-m",
-                "swe.budget",
-                "--worker", str(output),
-            ],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-        )
-
-        # 扣除进程创建耗时后再等待，保证启动开销也计入整体解题时限。
-        try:
-            remaining = max(
-                0, TASK_SECONDS - (time.monotonic() - started)
+    try:
+        with (output / "agent.log").open("wb") as log:
+            process = subprocess.Popen(
+                [
+                    sys.executable, "-B", "-u", "-m",
+                    "swe.budget",
+                    "--worker", str(output),
+                ],
+                stdout=log,
+                stderr=subprocess.STDOUT,
             )
+
+            # 扣除进程创建耗时后再等待，保证启动开销也计入整体解题时限。
+            remaining = max(0, TASK_SECONDS - (time.monotonic() - started))
             process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            # 标记整体超时，工作进程的结束与回收统一由下面的清理阶段处理。
-            timed_out = True
-        finally:
-            # 工作进程仍在运行时强制结束并等待回收，阻止其继续请求模型。
-            if process.poll() is None:
-                process.kill()
-                process.wait()
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    except OSError as error:
+        if process is not None:
+            raise
+        startup_error = error
+    finally:
+        # 工作进程仍在运行时强制结束并等待回收，阻止其继续请求模型。
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
 
-            # 解题耗时不包含随后停止容器的时间。
-            seconds = round(time.monotonic() - started, 3)
+        # 解题耗时不包含随后停止容器的时间。
+        seconds = round(time.monotonic() - started, 3)
 
-            # 停止本题专用容器中的剩余命令，保留容器文件供后续读取。
-            try:
-                subprocess.run(
-                    ["docker", "stop", "--time", "0", container],
-                    capture_output=True,
-                    check=True,
-                    timeout=120,
-                )
-            except (OSError, subprocess.SubprocessError) as error:
-                # 暂存清理错误，先完成统计落盘，再向调用方报告失败。
-                cleanup_error = f"{type(error).__name__}: {error}"
+        # 容器由本题使用，即使未能启动工作进程也需要停止。
+        try:
+            subprocess.run(
+                ["docker", "stop", "--time", "0", container],
+                capture_output=True,
+                check=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            # 暂存清理错误，先完成统计落盘，再向调用方报告失败。
+            cleanup_error = f"{type(error).__name__}: {error}"
 
     # 区分整体超时、工作进程异常和正常退出；正常退出时沿用智能体保存的结束原因。
     result_path = output / "agent_result.json"
-    if timed_out:
+    if startup_error is not None:
+        result = {
+            "exit_reason": "error",
+            "error_type": type(startup_error).__name__,
+            "error": str(startup_error),
+        }
+    elif timed_out:
         result = {"exit_reason": "time_limit"}
     elif process.returncode != 0:
         result = {"exit_reason": "error"}
@@ -136,7 +145,9 @@ def run_case(task: str, container: str, workdir: str, output: Path, *,
     result["cleanup_error"] = cleanup_error
     write_json(result_path, result)
 
-    # 清理成功时返回统计，清理失败则在结果已经保存后抛出异常。
+    # 落盘后再报告错误，启动失败时保留原始异常。
+    if startup_error is not None:
+        raise startup_error
     if cleanup_error is not None:
         raise RuntimeError(f"本题统计已保存，但容器停止失败：{cleanup_error}")
     return result

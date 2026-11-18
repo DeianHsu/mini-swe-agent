@@ -4,6 +4,7 @@ from decimal import Decimal
 import json
 import os
 from pathlib import Path
+from runpy import run_path
 import subprocess
 import tempfile
 import unittest
@@ -61,6 +62,21 @@ class ThinkingModeTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", self.requests[0])
         self.assertEqual(metadata["thinking_mode"], "disabled")
 
+    def test_missing_deepseek_configuration_fails_before_creating_client(self):
+        settings = {
+            "DEEPSEEK_API_KEY": "offline-test-key",
+            "DEEPSEEK_BASE_URL": "https://example.invalid",
+            "OPENAI_API_KEY": "other-offline-key",
+            "OPENAI_BASE_URL": "https://other.example.invalid",
+        }
+        for missing in ("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"):
+            with self.subTest(missing=missing), patch.dict(os.environ, settings), \
+                 patch("dotenv.load_dotenv"), patch("openai.OpenAI") as create_client:
+                del os.environ[missing]
+                with self.assertRaisesRegex(ValueError, missing):
+                    run_path(use_llm.__file__)
+                create_client.assert_not_called()
+
     def test_max_thinking_survives_tool_round_trip_and_counts_output_once(self):
         reasoning = "mock reasoning " * 20000
         self.responses.extend([
@@ -92,6 +108,24 @@ class ThinkingModeTests(unittest.TestCase):
         self.assertEqual(usage["completion_tokens"], 200)
         self.assertEqual(usage["total_tokens"], 400)
         self.assertEqual(Decimal(usage["known_cost_usd"]), Decimal("0.00028824"))
+
+    def test_invalid_prompt_usage_preserves_other_responses(self):
+        trajectory = self.root / "trajectory.jsonl"
+        mini_agent.record_event(trajectory, "start", {
+            "token_prices_per_million": {key: str(price) for key, price in cost.TOKEN_PRICES.items()},
+        })
+        for step, prompt_tokens in enumerate((100, None, 100), start=1):
+            mini_agent.record_event(trajectory, "request", {"step": step})
+            mini_agent.record_event(trajectory, "assistant", {
+                "step": step, "usage": {**self.usage, "prompt_tokens": prompt_tokens},
+            })
+
+        usage = cost.read_usage(trajectory)
+        self.assertEqual((usage["model_calls"], usage["accounted_calls"]), (3, 2))
+        self.assertEqual(usage["total_tokens"], 400)
+        self.assertEqual(Decimal(usage["known_cost_usd"]), Decimal("0.00028824"))
+        self.assertFalse(usage["usage_complete"])
+        self.assertIsNone(usage["budget_cost_usd"])
 
     def test_unsupported_mode_fails_before_sending_a_request(self):
         with self.assertRaisesRegex(ValueError, "thinking_mode"):
@@ -132,6 +166,20 @@ class ThinkingModeTests(unittest.TestCase):
         self.assertEqual(result["thinking_mode"], "max")
         self.assertIsNone(result["budget_cost_usd"])
         self.assertEqual(self.requests, [])
+
+    def test_worker_launch_failure_stops_container_and_saves_error(self):
+        output = self.root / "failed"
+        with patch.object(budget.subprocess, "Popen", side_effect=OSError("worker launch failed")), \
+             patch.object(budget.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as stop:
+            with self.assertRaisesRegex(OSError, "worker launch failed"):
+                budget.run_case("offline check", "unused", "/app", output)
+
+        stop.assert_called_once()
+        self.assertEqual(stop.call_args.args[0], ["docker", "stop", "--time", "0", "unused"])
+        result = json.loads((output / "agent_result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["exit_reason"], "error")
+        self.assertEqual(result["error"], "worker launch failed")
+        self.assertEqual(result["model_calls"], 0)
 
     def test_budget_cli_defaults_to_disabled_and_accepts_max(self):
         task = self.root / "task.txt"

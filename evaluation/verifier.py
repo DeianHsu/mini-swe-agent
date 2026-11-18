@@ -100,9 +100,11 @@ def verify_patch(task_dir: Path, config: dict, image_id: str, workdir: str,
              "timeout", "--signal=KILL", str(verifier_timeout), "bash", "/tests/test.sh"],
             log_path, timeout=verifier_timeout + 15, output=verifier_log, check=False,
         )
+    if verified.returncode not in (0, 1):
+        raise RuntimeError(f"官方判分进程异常退出，退出码 {verified.returncode}")
     reward = (verifier_logs / "reward.txt").read_text(encoding="utf-8").strip()
     if reward not in ("0", "1"):
         raise ValueError(f"官方判分产生无效 reward：{reward!r}")
-    if (reward == "1" and verified.returncode != 0) or verified.returncode not in (0, 1):
+    if reward == "1" and verified.returncode != 0:
         raise RuntimeError(f"官方 reward 与判分进程退出状态不一致：{reward=}, {verified.returncode=}")
     return {"resolved": reward == "1", "verifier_returncode": verified.returncode}

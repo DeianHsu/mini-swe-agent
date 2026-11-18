@@ -72,20 +72,17 @@ def read_usage(path: Path) -> dict:
                     if prices is None:
                         raise ValueError("轨迹缺少起始价目，无法计算费用")
 
-                    # 读取本轮所需的用量字段并计算费用，缺失或不可计算的记录标为不完整。
+                    # 本轮各项用量及费用都可计算时，才更新累计统计。
                     try:
-                        current = {key: usage[key] for key in tokens}
+                        updated_tokens = {key: total + usage[key] for key, total in tokens.items()}
                         cost = calculate_cost(usage, prices)
                     except (KeyError, TypeError):
                         # 此响应无法核算，保留其他响应的已知成本。
                         complete = False
                         continue
 
-                    # 累计各类词元与费用，再增加已核算响应数。
                     # 缓存命中量作为输入的细分项保存，不另外计入总词元数。
-                    for key, value in current.items():
-                        tokens[key] += value
-
+                    tokens = updated_tokens
                     known_cost += cost
                     accounted_calls += 1
 

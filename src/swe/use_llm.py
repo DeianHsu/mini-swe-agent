@@ -7,14 +7,20 @@ import os
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# 从 .env 加载模型连接配置，供下面的客户端读取。
+# 要求显式提供 DeepSeek 配置，防止客户端回退到 OpenAI 的地址或密钥。
 load_dotenv()
+api_key = os.getenv("DEEPSEEK_API_KEY")
+base_url = os.getenv("DEEPSEEK_BASE_URL")
+if not api_key:
+    raise ValueError("缺少模型配置 DEEPSEEK_API_KEY")
+if not base_url:
+    raise ValueError("缺少模型配置 DEEPSEEK_BASE_URL")
 
 # 复用同一个客户端，并设置请求超时。
 # 关闭软件开发工具包（SDK）内部重试，使每轮请求可以明确记账。
 client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url=os.getenv("DEEPSEEK_BASE_URL"),
+    api_key=api_key,
+    base_url=base_url,
     timeout=120.0,
     max_retries=0,
 )

@@ -56,8 +56,9 @@ class CalibrationTests(unittest.TestCase):
             mode = log_path.parent.name
             if mode == self.timeout_mode:
                 raise subprocess.TimeoutExpired(args, timeout)
-            (log_path.parent / "verifier/reward.txt").write_text(self.rewards[mode], encoding="utf-8")
             returncode = (0 if self.rewards[mode] == "1" else 1) if self.returncode is None else self.returncode
+            if returncode in (0, 1):
+                (log_path.parent / "verifier/reward.txt").write_text(self.rewards[mode], encoding="utf-8")
         elif args[:3] == ["docker", "rm", "-f"] and check and self.cleanup_failure:
             raise subprocess.CalledProcessError(1, args)
         return subprocess.CompletedProcess(args, returncode, stdout)
@@ -124,6 +125,7 @@ class CalibrationTests(unittest.TestCase):
         result = self.calibrate()
         self.assertFalse(result["passed"])
         self.assertTrue(all(check["error_type"] == "RuntimeError" for check in result["checks"]))
+        self.assertTrue(all("137" in check["error"] for check in result["checks"]))
 
     def test_reference_patch_application_failure_is_recorded(self):
         self.patch_failure = True

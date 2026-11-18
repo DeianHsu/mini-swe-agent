@@ -99,12 +99,9 @@ def run_case(dataset: Path, manifest: dict, index: int, output: Path) -> dict:
         raise ValueError("题目序号超出清单范围")
     instance_id = manifest["instances"][index]
     task_dir = dataset / "v2/tasks" / instance_id
-    config = tomllib.loads((task_dir / "task.toml").read_text(encoding="utf-8"))
     case_dir = output.resolve() / instance_id
     case_dir.mkdir(parents=True, exist_ok=False)
     verifier.save_json(case_dir / "case.json", {"instance_id": instance_id, "run_id": manifest["run_id"]})
-    task_file = case_dir / "instruction.md"
-    task_file.write_text((task_dir / "instruction.md").read_text(encoding="utf-8"), encoding="utf-8")
 
     result = {
         "instance_id": instance_id,
@@ -132,9 +129,13 @@ def run_case(dataset: Path, manifest: dict, index: int, output: Path) -> dict:
     containers = []
     volume_created = False
     started = time.monotonic()
-    limits = verifier.container_limits(config)
 
     try:
+        config = tomllib.loads((task_dir / "task.toml").read_text(encoding="utf-8"))
+        limits = verifier.container_limits(config)
+        task_file = case_dir / "instruction.md"
+        task_file.write_text((task_dir / "instruction.md").read_text(encoding="utf-8"), encoding="utf-8")
+
         containers.append(capture_name)
         image_id, workdir, base_commit = verifier.prepare_image(config, capture_name, log_path)
         result["image_id"] = image_id
@@ -162,7 +163,11 @@ def run_case(dataset: Path, manifest: dict, index: int, output: Path) -> dict:
                                                thinking_mode=manifest["thinking_mode"])
         metrics_path = agent_output / "agent_result.json"
         if metrics_path.is_file():
-            result.update(json.loads(metrics_path.read_text(encoding="utf-8")))
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            result.update(metrics)
+            # 监管进程被中断时，工作进程可能只来得及留下含已确认费用的摘要。
+            if "usage_complete" not in metrics and metrics["budget_cost_usd"] is not None:
+                result.update(known_cost_usd=metrics["budget_cost_usd"], budget_cost_usd=None)
         settings_path = agent_output / "case.json"
         # 预算记录必须存在且匹配；缺失时保留消耗，但不能发布有效判分。
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
