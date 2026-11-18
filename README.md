@@ -26,7 +26,7 @@ src/
     └── cost.py              # 词元与费用统计
 ```
 
-`model()` 组织提示与消息历史，`agent()` 控制循环并调度工具，`execute()` 执行命令并返回退出码、标准输出和标准错误。每次命令启动独立进程，容器内文件修改会保留，跨次调用的 `cd` 和环境变量设置不会保留。
+`ask_model()` 组织提示与消息历史，`run_agent()` 控制循环并调度工具，`execute()` 执行命令并返回退出码、标准输出和标准错误。每次命令启动独立进程，容器内文件修改会保留，跨次调用的 `cd` 和环境变量设置不会保留。
 
 ## 安装与配置
 
@@ -65,7 +65,7 @@ docker exec -w /workspace mini-swe-learning bash -c 'echo Hello Agent! > hello.t
 uv run python -m swe.mini_agent
 ```
 
-默认任务列出工作目录并读取 `hello.txt`。任务位于 `src/swe/mini_agent.py` 的 `if __name__ == "__main__":` 中；演示通过 `budget.run_case()` 执行，预算在 `src/swe/budget.py` 中设置。轨迹与统计写入本地 `archive/demo/`，结束后停止本题容器。
+默认任务列出工作目录并读取 `hello.txt`。任务位于 `src/swe/mini_agent.py` 的 `if __name__ == "__main__":` 中；演示通过 `budget.run_with_budget()` 执行，预算在 `src/swe/budget.py` 中设置。轨迹与统计写入本地 `archive/demo/`，结束后停止本题容器。
 
 已有容器停止后可通过 `docker start mini-swe-learning` 再次启动。
 

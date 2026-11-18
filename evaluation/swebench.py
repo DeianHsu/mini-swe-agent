@@ -38,19 +38,20 @@ git -c safe.directory='*' --git-dir="$repo/.git" --work-tree="$candidate" \
 
 def make_manifest(dataset: Path, run_id: str, code_revision: str, *,
                   thinking_mode: str = "disabled") -> dict:
-    task_files = sorted((dataset / "v2/tasks").glob("*/task.toml"))
-    if len(task_files) != TASK_COUNT:
-        raise ValueError(f"全量评测需要 {TASK_COUNT} 题，实际找到 {len(task_files)} 题")
+    config_paths = sorted((dataset / "v2/tasks").glob("*/task.toml"))
+    if len(config_paths) != TASK_COUNT:
+        raise ValueError(f"全量评测需要 {TASK_COUNT} 题，实际找到 {len(config_paths)} 题")
 
     instances = []
-    for task_file in task_files:
-        config = tomllib.loads(task_file.read_text(encoding="utf-8"))
+    for config_path in config_paths:
+        task_dir = config_path.parent
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
         if config["agent"]["network_mode"] != "no-network" or config["agent"]["timeout_sec"] != 3000:
-            raise ValueError(f"{task_file.parent.name}: 与锁定的断网、50 分钟协议不符")
+            raise ValueError(f"{task_dir.name}: 与锁定的断网、50 分钟协议不符")
         for filename in ("instruction.md", "tests/test.sh", "tests/config.json"):
-            if not (task_file.parent / filename).is_file():
-                raise FileNotFoundError(task_file.parent / filename)
-        instances.append(task_file.parent.name)
+            if not (task_dir / filename).is_file():
+                raise FileNotFoundError(task_dir / filename)
+        instances.append(task_dir.name)
 
     return {
         "run_id": run_id,
@@ -72,14 +73,14 @@ def make_manifest(dataset: Path, run_id: str, code_revision: str, *,
     }
 
 
-def run_agent(task_file: Path, container: str, workdir: str, output: Path,
-              log_path: Path, *, thinking_mode: str = "disabled") -> int:
+def run_budget_cli(task_file: Path, container: str, workdir: str, run_dir: Path,
+                   log_path: Path, *, thinking_mode: str = "disabled") -> int:
     # 独立进程组用于在主线监管进程异常卡住时一并终止其子进程。
     with log_path.open("wb") as log:
         process = subprocess.Popen(
             [sys.executable, "-B", "-u", "-m", "swe.budget",
              "--task-file", str(task_file), "--container", container,
-             "--workdir", workdir, "--output", str(output), "--thinking-mode", thinking_mode],
+             "--workdir", workdir, "--output", str(run_dir), "--thinking-mode", thinking_mode],
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
         )
         try:
@@ -94,7 +95,42 @@ def run_agent(task_file: Path, container: str, workdir: str, output: Path,
             return process.returncode
 
 
-def run_case(dataset: Path, manifest: dict, index: int, output: Path) -> dict:
+def _read_agent_result(run_dir: Path, log_path: Path) -> dict:
+    result_path = run_dir / "agent_result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.is_file() else {}
+    if "usage_complete" in result:
+        return result
+
+    # 监管进程提前退出时，轨迹可能已经有用量，但汇总结果还没写出。
+    trace_path = run_dir / "trajectory.jsonl"
+    if trace_path.is_file():
+        try:
+            read = verifier.run_command([sys.executable, "-B", "-m", "swe.cost", str(trace_path)], log_path)
+            result.update(json.loads(read.stdout))
+            return result
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+            result["usage_error"] = str(error)
+
+    # 只有工作进程摘要时，仍可保留摘要中的已知费用。
+    if result.get("budget_cost_usd") is not None:
+        result.update(known_cost_usd=result["budget_cost_usd"], budget_cost_usd=None)
+    return result
+
+
+def _export_patch(case_dir: Path, image_id: str, workdir: str, limits: list[str],
+                  volume_name: str, capture_name: str) -> Path:
+    patch_path = case_dir / "model.patch"
+    with patch_path.open("wb") as patch:
+        verifier.run_command(
+            ["docker", "run", "--rm", "--name", capture_name, "--network", "none",
+             *limits, "--mount", f"type=volume,source={volume_name},target=/candidate,readonly",
+             "--entrypoint", "bash", image_id, "-c", CAPTURE_SCRIPT, "capture", workdir, "/candidate"],
+            case_dir / "runner.log", timeout=300, output=patch,
+        )
+    return patch_path
+
+
+def eval_case(dataset: Path, manifest: dict, index: int, output: Path) -> dict:
     if not 0 <= index < len(manifest["instances"]):
         raise ValueError("题目序号超出清单范围")
     instance_id = manifest["instances"][index]
@@ -157,20 +193,14 @@ def run_case(dataset: Path, manifest: dict, index: int, output: Path) -> dict:
                       prompt_tokens=None, completion_tokens=None, total_tokens=None,
                       budget_cost_usd=None, usage_complete=False)
         verifier.save_json(result_path, result)
-        agent_output = case_dir / "agent"
-        result["agent_returncode"] = run_agent(task_file, agent_name, workdir, agent_output,
-                                               case_dir / "budget.log",
-                                               thinking_mode=manifest["thinking_mode"])
-        metrics_path = agent_output / "agent_result.json"
-        if metrics_path.is_file():
-            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-            result.update(metrics)
-            # 监管进程被中断时，工作进程可能只来得及留下含已确认费用的摘要。
-            if "usage_complete" not in metrics and metrics["budget_cost_usd"] is not None:
-                result.update(known_cost_usd=metrics["budget_cost_usd"], budget_cost_usd=None)
-        settings_path = agent_output / "case.json"
+        agent_dir = case_dir / "agent"
+        result["agent_returncode"] = run_budget_cli(
+            task_file, agent_name, workdir, agent_dir, case_dir / "budget.log",
+            thinking_mode=manifest["thinking_mode"],
+        )
+        result.update(_read_agent_result(agent_dir, log_path))
         # 预算记录必须存在且匹配；缺失时保留消耗，但不能发布有效判分。
-        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        settings = json.loads((agent_dir / "case.json").read_text(encoding="utf-8"))
         result["budget"] = {key: settings[key] for key in manifest["budget"]}
         if result["budget"] != manifest["budget"]:
             raise ValueError("主线实际预算与本轮预定预算不一致")
@@ -182,14 +212,7 @@ def run_case(dataset: Path, manifest: dict, index: int, output: Path) -> dict:
         verifier.save_json(result_path, result)
         # 不恢复智能体容器；冻结工作区后交给干净镜像中的 Git 导出补丁。
         verifier.run_command(["docker", "stop", "--time", "0", agent_name], log_path)
-        patch_path = case_dir / "model.patch"
-        with patch_path.open("wb") as patch:
-            verifier.run_command(
-                ["docker", "run", "--rm", "--name", capture_name, "--network", "none",
-                 *limits, "--mount", f"type=volume,source={volume_name},target=/candidate,readonly",
-                 "--entrypoint", "bash", image_id, "-c", CAPTURE_SCRIPT, "capture", workdir, "/candidate"],
-                log_path, timeout=300, output=patch,
-            )
+        patch_path = _export_patch(case_dir, image_id, workdir, limits, volume_name, capture_name)
 
         result["stage"] = "verifier"
         verifier.save_json(result_path, result)
@@ -252,7 +275,7 @@ def main() -> None:
         if sys.platform != "linux":
             parser.error("实际评测需在运行 Linux 容器的 Linux 主机上执行")
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-        result = run_case(args.dataset, manifest, args.index, args.output)
+        result = eval_case(args.dataset, manifest, args.index, args.output)
         print(json.dumps(result, ensure_ascii=False))
         if result["status"] != "graded" or result["cleanup_errors"]:
             raise SystemExit(1)

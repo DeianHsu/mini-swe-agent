@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 
-from swe.cost import read_usage
+from swe.cost import read_run_usage
 
 # 整体解题时限为 50 分钟，使用秒作为进程等待的计时单位。
 TASK_SECONDS = 3000
@@ -28,37 +28,47 @@ def write_json(path: Path, data: dict) -> None:
 
 
 # 在工作子进程中读取运行参数、执行智能体，并保存智能体的结束摘要。
-def run_worker(output: Path) -> None:
-    # 只有实际解题的子进程才加载模型依赖，父进程可以独立处理时限与统计。
-    from swe.mini_agent import agent
+def run_worker(run_dir: Path) -> None:
+    result_path = run_dir / "agent_result.json"
+    try:
+        # 只有实际解题的子进程才加载模型依赖。
+        from swe.mini_agent import run_agent
 
-    # 从本次运行的参数文件还原任务、容器和预算，保证执行值与记录值一致。
-    case = json.loads(
-        (output / "case.json").read_text(encoding="utf-8")
-    )
-    result = agent(
-        case["task"],
-        container_name=case["container"],
-        workdir=case["workdir"],
-        timeout=case["command_timeout"],
-        max_steps=case["max_steps"],
-        cost_limit=float(case["cost_limit_usd"]),
-        trajectory_path=output / "trajectory.jsonl",
-        thinking_mode=case["thinking_mode"],
-    )
+        case = json.loads((run_dir / "case.json").read_text(encoding="utf-8"))
+        result = run_agent(
+            case["task"],
+            container_name=case["container"],
+            workdir=case["workdir"],
+            timeout=case["command_timeout"],
+            max_steps=case["max_steps"],
+            cost_limit=float(case["cost_limit_usd"]),
+            trace_path=run_dir / "trajectory.jsonl",
+            thinking_mode=case["thinking_mode"],
+        )
+    except Exception as error:
+        try:
+            write_json(result_path, {
+                "exit_reason": "error",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            })
+        except OSError as write_error:
+            error.add_note(f"保存工作进程错误失败：{write_error}")
+        raise
+
     # 对话已经逐条保存在轨迹中，结果文件只保留摘要，避免重复写入大段历史。
     result.pop("history")
-    write_json(output / "agent_result.json", result)
+    write_json(result_path, result)
 
 
 # 启动并监管一次独立解题过程，结束后停止本题容器并汇总运行统计。
 # 正常结束、超时和工作进程失败均使用同一份轨迹恢复已知用量。
-def run_case(task: str, container: str, workdir: str, output: Path, *,
-             thinking_mode: str = "disabled") -> dict:
+def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
+                    thinking_mode: str = "disabled") -> dict:
     # 每次使用独立目录，禁止覆盖已经开始过的尝试。
-    output.mkdir(parents=True, exist_ok=False)
+    run_dir.mkdir(parents=True, exist_ok=False)
     # 固定本次任务的输入和预算，供工作进程读取并留作后续检查。
-    write_json(output / "case.json", {
+    write_json(run_dir / "case.json", {
         "task": task,
         "container": container,
         "workdir": workdir,
@@ -78,12 +88,12 @@ def run_case(task: str, container: str, workdir: str, output: Path, *,
 
     # 将智能体放入独立 Python 进程，并把标准输出和标准错误合并保存到日志。
     try:
-        with (output / "agent.log").open("wb") as log:
+        with (run_dir / "agent.log").open("wb") as log:
             process = subprocess.Popen(
                 [
                     sys.executable, "-B", "-u", "-m",
                     "swe.budget",
-                    "--worker", str(output),
+                    "--worker", str(run_dir),
                 ],
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -120,7 +130,7 @@ def run_case(task: str, container: str, workdir: str, output: Path, *,
             cleanup_error = f"{type(error).__name__}: {error}"
 
     # 区分整体超时、工作进程异常和正常退出；正常退出时沿用智能体保存的结束原因。
-    result_path = output / "agent_result.json"
+    result_path = run_dir / "agent_result.json"
     if startup_error is not None:
         result = {
             "exit_reason": "error",
@@ -130,15 +140,14 @@ def run_case(task: str, container: str, workdir: str, output: Path, *,
     elif timed_out:
         result = {"exit_reason": "time_limit"}
     elif process.returncode != 0:
-        result = {"exit_reason": "error"}
+        result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.is_file() else {}
+        result.update(exit_reason="error", worker_returncode=process.returncode)
     else:
-        result = json.loads(
-            result_path.read_text(encoding="utf-8")
-        )
+        result = json.loads(result_path.read_text(encoding="utf-8"))
 
     # 从轨迹恢复已知消耗，避免超时或异常覆盖此前已经产生的费用和轮数。
     # 最后补充解题耗时及容器清理状态，写出供调用方读取的结果。
-    result.update(read_usage(output / "trajectory.jsonl"))
+    result.update(read_run_usage(run_dir / "trajectory.jsonl"))
     result["seconds"] = seconds
     # 即使工作进程超时或失败，结果也保留本次实际采用的思考模式。
     result["thinking_mode"] = thinking_mode
@@ -175,7 +184,7 @@ def main() -> None:
         parser.error("必须提供 --task-file、--container 和 --output")
 
     # 读取任务文本，并使用绝对输出路径启动带预算的完整运行流程。
-    result = run_case(
+    result = run_with_budget(
         args.task_file.read_text(encoding="utf-8"),
         args.container,
         args.workdir,

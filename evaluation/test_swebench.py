@@ -86,8 +86,8 @@ class EvaluationTests(unittest.TestCase):
 
     def evaluate(self):
         with patch.object(verifier, "run_command", side_effect=self.command), \
-             patch.object(swebench, "run_agent", side_effect=self.agent) as agent:
-            result = swebench.run_case(self.dataset, self.manifest, 0, self.output)
+             patch.object(swebench, "run_budget_cli", side_effect=self.agent) as agent:
+            result = swebench.eval_case(self.dataset, self.manifest, 0, self.output)
         return result, agent
 
     def test_full_manifest_rejects_missing_tasks(self):
@@ -115,8 +115,8 @@ class EvaluationTests(unittest.TestCase):
         process = MagicMock(returncode=0)
         process.wait.return_value = 0
         with patch.object(swebench.subprocess, "Popen", return_value=process) as popen:
-            swebench.run_agent(self.root / "instruction.md", "container", "/app", self.output,
-                              self.root / "budget.log", thinking_mode="max")
+            swebench.run_budget_cli(self.root / "instruction.md", "container", "/app", self.output,
+                                    self.root / "budget.log", thinking_mode="max")
         command = popen.call_args.args[0]
         self.assertEqual(command[command.index("--thinking-mode") + 1], "max")
         self.assertIn("swe.budget", command)
@@ -163,23 +163,59 @@ class EvaluationTests(unittest.TestCase):
         self.assertFalse(result["usage_complete"])
         agent.assert_called_once()
 
-    def test_interrupted_supervisor_preserves_worker_cost(self):
+    def test_interrupted_budget_keeps_worker_cost(self):
         confirmed_cost = self.metrics["budget_cost_usd"]
         self.metrics = {key: self.metrics[key] for key in ("exit_reason", "model_calls", "budget_cost_usd")}
 
-        def interrupted_supervisor(*args, **kwargs):
+        def interrupted_budget(*args, **kwargs):
             self.agent(*args, **kwargs)
             return -9
 
         with patch.object(verifier, "run_command", side_effect=self.command), \
-             patch.object(swebench, "run_agent", side_effect=interrupted_supervisor):
-            result = swebench.run_case(self.dataset, self.manifest, 0, self.output)
+             patch.object(swebench, "run_budget_cli", side_effect=interrupted_budget):
+            result = swebench.eval_case(self.dataset, self.manifest, 0, self.output)
 
         self.assertEqual(result["agent_returncode"], -9)
         self.assertIsNone(result["budget_cost_usd"])
         self.assertEqual(result["known_cost_usd"], confirmed_cost)
         summary = report.write_report(self.output, manifest=self.manifest)
         self.assertEqual(summary["known_total_cost_usd"], confirmed_cost)
+        self.assertIsNone(summary["total_cost_usd"])
+
+    def test_interrupted_budget_reads_trace_without_worker_result(self):
+        agent_dir = self.output / self.instance_id / "agent"
+        trace_path = agent_dir / "trajectory.jsonl"
+        usage = {key: value for key, value in self.metrics.items() if key not in ("exit_reason", "seconds")}
+        usage.update(model_calls=3, budget_cost_usd=None, usage_complete=False)
+
+        def interrupted_budget(task_file, container, workdir, run_dir, log_path, *, thinking_mode):
+            run_dir.mkdir()
+            verifier.save_json(run_dir / "case.json", {**self.manifest["budget"], "thinking_mode": thinking_mode})
+            trace_path.touch()
+            return -9
+
+        read_command = [sys.executable, "-B", "-m", "swe.cost"]
+
+        def command(args, log_path, **kwargs):
+            if args[:4] == read_command:
+                return subprocess.CompletedProcess(args, 0, json.dumps(usage).encode("utf-8"))
+            return self.command(args, log_path, **kwargs)
+
+        with patch.object(verifier, "run_command", side_effect=command) as run_command, \
+             patch.object(swebench, "run_budget_cli", side_effect=interrupted_budget):
+            result = swebench.eval_case(self.dataset, self.manifest, 0, self.output)
+
+        run_command.assert_any_call([*read_command, str(trace_path)], self.output / self.instance_id / "runner.log")
+        self.assertTrue(result["resolved"])
+        self.assertEqual(result["agent_returncode"], -9)
+        self.assertEqual(result["model_calls"], 3)
+        self.assertEqual(result["accounted_calls"], 2)
+        self.assertEqual(result["total_tokens"], 230)
+        self.assertIsNone(result["seconds"])
+        self.assertEqual(result["known_cost_usd"], self.metrics["known_cost_usd"])
+        self.assertFalse(result["usage_complete"])
+        summary = report.write_report(self.output, manifest=self.manifest)
+        self.assertEqual(summary["known_total_cost_usd"], self.metrics["known_cost_usd"])
         self.assertIsNone(summary["total_cost_usd"])
 
     def test_verifier_timeout_preserves_consumption_and_cleans_resources(self):
@@ -198,14 +234,14 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertIsNone(result["resolved"])
 
-    def test_supervisor_timeout_kills_process_group_without_retry(self):
+    def test_budget_timeout_kills_process_group_without_retry(self):
         process = MagicMock(pid=123, returncode=-9)
         process.wait.side_effect = [subprocess.TimeoutExpired("agent", 3180), -9]
         with patch.object(swebench.subprocess, "Popen", return_value=process) as popen, \
              patch.object(swebench.os, "killpg", create=True) as killpg, \
              patch.object(swebench.signal, "SIGKILL", 9, create=True):
-            code = swebench.run_agent(self.root / "instruction.md", "container", "/app",
-                                      self.output, self.root / "budget.log")
+            code = swebench.run_budget_cli(self.root / "instruction.md", "container", "/app",
+                                            self.output, self.root / "budget.log")
         self.assertEqual(code, -9)
         popen.assert_called_once()
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
@@ -298,8 +334,8 @@ class EvaluationTests(unittest.TestCase):
 
     def test_existing_attempt_is_never_overwritten(self):
         self.evaluate()
-        with patch.object(swebench, "run_agent") as agent, self.assertRaises(FileExistsError):
-            swebench.run_case(self.dataset, self.manifest, 0, self.output)
+        with patch.object(swebench, "run_budget_cli") as agent, self.assertRaises(FileExistsError):
+            swebench.eval_case(self.dataset, self.manifest, 0, self.output)
         agent.assert_not_called()
 
     def test_budget_mismatch_is_not_published_as_a_valid_score(self):
@@ -310,8 +346,8 @@ class EvaluationTests(unittest.TestCase):
             })
             return result
         with patch.object(verifier, "run_command", side_effect=self.command), \
-             patch.object(swebench, "run_agent", side_effect=wrong_budget):
-            result = swebench.run_case(self.dataset, self.manifest, 0, self.output)
+             patch.object(swebench, "run_budget_cli", side_effect=wrong_budget):
+            result = swebench.eval_case(self.dataset, self.manifest, 0, self.output)
         self.assertIsNone(result["resolved"])
         self.assertEqual(result["status"], "error")
 
@@ -324,8 +360,8 @@ class EvaluationTests(unittest.TestCase):
             return result
 
         with patch.object(verifier, "run_command", side_effect=self.command), \
-             patch.object(swebench, "run_agent", side_effect=wrong_mode):
-            result = swebench.run_case(self.dataset, self.manifest, 0, self.output)
+             patch.object(swebench, "run_budget_cli", side_effect=wrong_mode):
+            result = swebench.eval_case(self.dataset, self.manifest, 0, self.output)
         self.assertEqual(result["status"], "error")
         self.assertIn("思考模式", result["error"])
         self.assertIsNone(result["resolved"])
@@ -339,8 +375,8 @@ class EvaluationTests(unittest.TestCase):
             return result
 
         with patch.object(verifier, "run_command", side_effect=self.command), \
-             patch.object(swebench, "run_agent", side_effect=missing_budget):
-            result = swebench.run_case(self.dataset, self.manifest, 0, self.output)
+             patch.object(swebench, "run_budget_cli", side_effect=missing_budget):
+            result = swebench.eval_case(self.dataset, self.manifest, 0, self.output)
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["error_type"], "FileNotFoundError")
         self.assertIsNone(result["resolved"])

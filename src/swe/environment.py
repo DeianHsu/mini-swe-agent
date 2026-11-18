@@ -1,22 +1,34 @@
 # 在指定的已有 Docker 容器和工作目录中执行 Bash 命令，并限制单条命令的运行时间。
-# 将退出码、标准输出和标准错误整理成模型可读的观察文本，并限制输出长度，避免过多日志占用上下文。
+# 将退出码、标准输出和标准错误整理成短文本，供模型读取。
 
+from os import SEEK_END
 import subprocess
+from tempfile import TemporaryFile
+from typing import BinaryIO
 
-# 限制返回给模型的单次命令输出长度，避免大量日志占满对话上下文。
-MAX_OBSERVATION_CHARS = 16000
+MAX_OUTPUT_CHARS = 16000
 
 
-# 限制观察文本的长度，超出上限时保留开头和结尾，并提示模型缩小读取范围。
-def limit_observation(text: str) -> str:
-    # 未超限的输出直接返回，保留完整内容。
-    if len(text) <= MAX_OBSERVATION_CHARS:
+def limit_output(text: str) -> str:
+    """输出过长时只保留首尾，并提示模型缩小读取范围。"""
+    if len(text) <= MAX_OUTPUT_CHARS:
         return text
-    # 先为截断提示预留空间，再将剩余字符额度分配给原文的首尾。
-    notice = f"\n[输出已截断；原始长度 {len(text)} 字符。请缩小命令范围继续读取。]\n"
-    available = MAX_OBSERVATION_CHARS - len(notice)
+    notice = "\n[输出已截断。请缩小命令范围继续读取。]\n"
+    available = MAX_OUTPUT_CHARS - len(notice)
     head = available // 2
     return text[:head] + notice + text[-(available - head):]
+
+
+def _read_output(stream: BinaryIO) -> str:
+    # 每个 UTF-8 字符最多四字节。两端各读足够的字节供最终截断。
+    sample_bytes = MAX_OUTPUT_CHARS * 4
+    size = stream.seek(0, SEEK_END)
+    stream.seek(0)
+    data = stream.read(sample_bytes)
+    if size > sample_bytes:
+        stream.seek(max(sample_bytes, size - sample_bytes))
+        data += stream.read(sample_bytes)
+    return data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
 # 在指定容器和目录内执行一条命令，返回退出码、标准输出和标准错误。
@@ -30,28 +42,19 @@ def execute(command: str, *, container_name: str = "mini-swe-learning",
         "bash", "-c", command,
     ]
 
-    # 收集命令输出，并替换无法按 UTF-8 解码的字节。
-    # 宿主进程额外等待 15 秒，为容器命令结束及通信收尾留出时间。
-    try:
-        result = subprocess.run(
-            args=args,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout + 15,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        # 执行通道仍未返回时向上抛出异常，由预算监管流程结束本次任务。
-        raise RuntimeError(
-            "Docker 执行通道超时，本题应结束并停止容器"
-        ) from error
+    # 用临时文件接收两路输出，再读取首尾，避免把整份日志读进内存。
+    with TemporaryFile() as stdout, TemporaryFile() as stderr:
+        try:
+            result = subprocess.run(
+                args=args, stdout=stdout, stderr=stderr, timeout=timeout + 15, check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            # 宿主进程额外等待 15 秒。超时后由预算监管流程停止容器。
+            raise RuntimeError("Docker 执行通道超时，本题应结束并停止容器") from error
 
-    # 按固定格式拼接执行结果，再限制其长度后交给智能体。
-    output = (
-        f"Exit code:{result.returncode}\n"
-        f"STDOUT:\n{result.stdout}\n"
-        f"STDERR:\n{result.stderr}\n"
-    )
-    return limit_observation(output)
+        output = (
+            f"Exit code:{result.returncode}\n"
+            f"STDOUT:\n{_read_output(stdout)}\n"
+            f"STDERR:\n{_read_output(stderr)}\n"
+        )
+    return limit_output(output)
