@@ -40,7 +40,6 @@ def trim_tool_history(history: list[dict]) -> None:
 def ask_model(client, task: str, history: list[dict], workdir: str, *,
               thinking_mode: str) -> tuple[dict, dict]:
     """组装任务和历史消息并请求一轮模型回复。"""
-    trim_tool_history(history)
     prompt = dedent(f"""
         你是一个编程智能体。
         执行环境是 Linux 容器中的 Bash，当前目录为 {workdir}。
@@ -122,6 +121,7 @@ def run_agent(task: str, *, container_name: str = "mini-swe-learning",
                 model_calls += 1
                 cost_known = False
                 record_event(trace_path, "request", {"step": model_calls})
+                trim_tool_history(history)
                 message, metadata = ask_model(client, task, history, workdir, thinking_mode=thinking_mode)
                 history.append(message)
 

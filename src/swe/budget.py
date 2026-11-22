@@ -61,6 +61,31 @@ def run_worker(run_dir: Path) -> None:
     write_json(result_path, result)
 
 
+def _read_worker_result(
+    result_path: Path,
+    *,
+    returncode: int | None,
+    timed_out: bool,
+    startup_error: OSError | None,
+) -> dict:
+    """根据工作进程的退出情况读取解题结果。"""
+    if startup_error is not None:
+        return {
+            "exit_reason": "error",
+            "error_type": type(startup_error).__name__,
+            "error": str(startup_error),
+        }
+    if timed_out:
+        return {"exit_reason": "time_limit"}
+
+    result = {}
+    if returncode == 0 or result_path.is_file():
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    if returncode != 0:
+        result.update(exit_reason="error", worker_returncode=returncode)
+    return result
+
+
 # 启动并监管一次独立解题过程，结束后停止本题容器并汇总运行统计。
 # 正常结束、超时和工作进程失败均使用同一份轨迹恢复已知用量。
 def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
@@ -129,21 +154,13 @@ def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
             # 暂存清理错误，先完成统计落盘，再向调用方报告失败。
             cleanup_error = f"{type(error).__name__}: {error}"
 
-    # 区分整体超时、工作进程异常和正常退出；正常退出时沿用智能体保存的结束原因。
     result_path = run_dir / "agent_result.json"
-    if startup_error is not None:
-        result = {
-            "exit_reason": "error",
-            "error_type": type(startup_error).__name__,
-            "error": str(startup_error),
-        }
-    elif timed_out:
-        result = {"exit_reason": "time_limit"}
-    elif process.returncode != 0:
-        result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.is_file() else {}
-        result.update(exit_reason="error", worker_returncode=process.returncode)
-    else:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+    result = _read_worker_result(
+        result_path,
+        returncode=process.returncode if process is not None else None,
+        timed_out=timed_out,
+        startup_error=startup_error,
+    )
 
     # 从轨迹恢复已知消耗，避免超时或异常覆盖此前已经产生的费用和轮数。
     # 最后补充解题耗时及容器清理状态，写出供调用方读取的结果。
