@@ -19,7 +19,7 @@ def limit_output(text: str) -> str:
     return text[:head] + notice + text[-(available - head):]
 
 
-def _read_output(stream: BinaryIO) -> str:
+def _read_output_sample(stream: BinaryIO) -> str:
     # 每个 UTF-8 字符最多四字节。两端各读足够的字节供最终截断。
     sample_bytes = MAX_OUTPUT_CHARS * 4
     size = stream.seek(0, SEEK_END)
@@ -31,9 +31,9 @@ def _read_output(stream: BinaryIO) -> str:
     return data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
-# 在指定容器和目录内执行一条命令，返回退出码、标准输出和标准错误。
 def execute(command: str, *, container_name: str = "mini-swe-learning",
             workdir: str = "/workspace", timeout: int = 60) -> str:
+    """执行容器命令，将退出码、标准输出和标准错误整理成受长度限制的文本。"""
     # 在容器内用 timeout 限制实际命令的运行时间，超时发送 KILL 信号。
     # Bash 使用非登录模式，沿用镜像原有的工具路径等环境配置。
     args = [
@@ -54,7 +54,7 @@ def execute(command: str, *, container_name: str = "mini-swe-learning",
 
         output = (
             f"Exit code:{result.returncode}\n"
-            f"STDOUT:\n{_read_output(stdout)}\n"
-            f"STDERR:\n{_read_output(stderr)}\n"
+            f"STDOUT:\n{_read_output_sample(stdout)}\n"
+            f"STDERR:\n{_read_output_sample(stderr)}\n"
         )
     return limit_output(output)

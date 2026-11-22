@@ -6,8 +6,8 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
-# 以固定高峰价估算费用，单位为美元/百万词元（token）；本表适用于 deepseek-flash。
-TOKEN_PRICES = {
+# 用于估算 deepseek-flash 费用的固定高峰价，单位为美元/百万词元。
+TOKEN_PRICES_PER_MILLION = {
     "prompt_cache_hit_tokens": Decimal("0.006"),
     "prompt_cache_miss_tokens": Decimal("0.30"),
     "completion_tokens": Decimal("1.20"),
@@ -15,8 +15,10 @@ TOKEN_PRICES = {
 TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens")
 
 
-def read_reply_usage(usage: dict | None,
-                     prices: dict[str, Decimal] = TOKEN_PRICES) -> tuple[dict[str, int], Decimal]:
+def summarize_reply_usage(
+    usage: dict | None,
+    prices: dict[str, Decimal] = TOKEN_PRICES_PER_MILLION,
+) -> tuple[dict[str, int], Decimal]:
     """核对单轮用量，返回词元数和美元费用。"""
     if usage is None:
         raise ValueError("模型响应缺少 usage，无法核算费用")
@@ -61,7 +63,7 @@ def read_run_usage(trace_path: Path) -> dict:
                     }
 
                 elif event["kind"] == "request":
-                    # 请求发起后即计入轮数，后续调用失败也不会丢掉这一轮记录。
+                    # 每条 request 事件计一次请求尝试，事件在实际发送前记录。
                     model_calls += 1
 
                 elif event["kind"] == "assistant":
@@ -69,7 +71,9 @@ def read_run_usage(trace_path: Path) -> dict:
                     if prices is None:
                         raise ValueError("轨迹缺少起始价目，无法计算费用")
                     try:
-                        reply_tokens, cost = read_reply_usage(data["usage"], prices)
+                        reply_tokens, cost = summarize_reply_usage(
+                            data["usage"], prices
+                        )
                     except (KeyError, TypeError, ValueError):
                         # 此响应无法核算，保留其他响应的已知成本。
                         usage_complete = False
@@ -80,7 +84,8 @@ def read_run_usage(trace_path: Path) -> dict:
                     known_cost += cost
                     accounted_calls += 1
 
-    # 只有轨迹完整、价目已知且每个请求都能核算费用时，统计才算完整。
+    # 用量完整要求起始价目存在，已记录的事件均写完整，模型回复均可核算。
+    # 请求尝试数与可核算的回复数也必须一致。
     usage_complete = (
         usage_complete
         and prices is not None

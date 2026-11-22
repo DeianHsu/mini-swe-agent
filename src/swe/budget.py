@@ -11,19 +11,17 @@ import time
 
 from swe.cost import read_run_usage
 
-# 整体解题时限为 50 分钟，使用秒作为进程等待的计时单位。
-TASK_SECONDS = 3000
+# 整体解题时限为 50 分钟。
+TASK_TIMEOUT_SECONDS = 3000
 
 
-# 保存父子进程交换的 JSON 数据，避免目标文件出现只写入了一部分的内容。
 def write_json(path: Path, data: dict) -> None:
-    # 先把完整数据写到目标文件同目录下的临时文件。
+    """先写同目录的临时文件，再替换目标文件，避免读取方看到半份 JSON。"""
     temporary = path.with_suffix(".tmp")
     temporary.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    # 写入成功后再替换目标文件，使读取方看到完整的一份结果。
     temporary.replace(path)
 
 
@@ -61,12 +59,15 @@ def run_worker(run_dir: Path) -> None:
     write_json(result_path, result)
 
 
-# 启动并监管一次独立解题过程，结束后停止本题容器并汇总运行统计。
-# 正常结束、超时和工作进程失败均使用同一份轨迹恢复已知用量。
 def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
                     thinking_mode: str = "disabled") -> dict:
+    """启动并监管一次解题，停止传入的容器并汇总运行统计。
+
+    正常结束、超时或工作进程失败时，均从轨迹恢复已记录的用量。
+    """
+
     def read_worker_result(
-        result_path: Path,
+        path: Path,
         *,
         returncode: int | None,
         timed_out: bool,
@@ -83,8 +84,8 @@ def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
             return {"exit_reason": "time_limit"}
 
         result = {}
-        if returncode == 0 or result_path.is_file():
-            result = json.loads(result_path.read_text(encoding="utf-8"))
+        if returncode == 0 or path.is_file():
+            result = json.loads(path.read_text(encoding="utf-8"))
         if returncode != 0:
             result.update(exit_reason="error", worker_returncode=returncode)
         return result
@@ -99,7 +100,7 @@ def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
         "max_steps": 250,
         "command_timeout": 60,
         "cost_limit_usd": "3",
-        "task_timeout_seconds": TASK_SECONDS,
+        "task_timeout_seconds": TASK_TIMEOUT_SECONDS,
         "thinking_mode": thinking_mode,
     })
 
@@ -124,7 +125,9 @@ def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
             )
 
             # 扣除进程创建耗时后再等待，保证启动开销也计入整体解题时限。
-            remaining = max(0, TASK_SECONDS - (time.monotonic() - started))
+            remaining = max(
+                0, TASK_TIMEOUT_SECONDS - (time.monotonic() - started)
+            )
             process.wait(timeout=remaining)
     except subprocess.TimeoutExpired:
         timed_out = True
@@ -139,7 +142,7 @@ def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
             process.wait()
 
         # 解题耗时不包含随后停止容器的时间。
-        seconds = round(time.monotonic() - started, 3)
+        elapsed_seconds = round(time.monotonic() - started, 3)
 
         # 容器由本题使用，即使未能启动工作进程也需要停止。
         try:
@@ -164,7 +167,7 @@ def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
     # 从轨迹恢复已知消耗，避免超时或异常覆盖此前已经产生的费用和轮数。
     # 最后补充解题耗时及容器清理状态，写出供调用方读取的结果。
     result.update(read_run_usage(run_dir / "trajectory.jsonl"))
-    result["seconds"] = seconds
+    result["seconds"] = elapsed_seconds
     # 即使工作进程超时或失败，结果也保留本次实际采用的思考模式。
     result["thinking_mode"] = thinking_mode
     result["cleanup_error"] = cleanup_error

@@ -48,8 +48,8 @@ def run_command(args: list[str], log_path: Path, *, timeout: float = 120,
     return result
 
 
-def container_limits(config: dict) -> list[str]:
-    """按官方任务配置设置资源限制，供解题、补丁导出和判分共用。"""
+def build_container_args(config: dict) -> list[str]:
+    """根据题目配置生成 Docker 容器的共用启动参数。"""
     return ["--cpus", str(config["environment"]["cpus"]),
             "--memory", f'{config["environment"]["memory_mb"]}m',
             "--ulimit", "nofile=65536:65536", "--init", "--user", "0:0"]
@@ -64,7 +64,8 @@ def prepare_image(config: dict, probe_name: str, log_path: Path) -> tuple[str, s
     image_id = json.loads(inspected.stdout)[0]["Id"]
     probe = run_command(
         ["docker", "run", "--rm", "--name", probe_name, "--network", "none",
-         *container_limits(config), "--entrypoint", "bash", image_id, "-c", PROBE_SCRIPT],
+         *build_container_args(config), "--entrypoint", "bash",
+         image_id, "-c", PROBE_SCRIPT],
         log_path,
     )
     workdir, base_commit = probe.stdout.decode("utf-8").strip().splitlines()
@@ -82,7 +83,7 @@ def verify_patch(task_dir: Path, config: dict, image_id: str, workdir: str,
     # 不挂载解题工作卷；空补丁直接测试原始镜像，非空补丁严格检查能否应用。
     run_command(
         ["docker", "run", "-d", "--name", container, "--network", "bridge",
-         *container_limits(config), "--env", "SDL_AUDIODRIVER=dummy",
+         *build_container_args(config), "--env", "SDL_AUDIODRIVER=dummy",
          "--mount", f"type=bind,source={(task_dir / 'tests').resolve()},target=/tests,readonly",
          "--mount", f"type=bind,source={verifier_logs},target=/logs/verifier",
          "--entrypoint", "sleep", image_id, "infinity"], log_path,
@@ -93,18 +94,25 @@ def verify_patch(task_dir: Path, config: dict, image_id: str, workdir: str,
                      "git", "-c", "safe.directory=*", "apply", "--binary", "/tmp/model.patch"],
                     log_path, timeout=300)
 
-    verifier_timeout = int(config["verifier"]["timeout_sec"])
+    timeout = int(config["verifier"]["timeout_sec"])
     with (case_dir / "verifier.log").open("wb") as verifier_log:
-        verified = run_command(
+        test_result = run_command(
             ["docker", "exec", "-w", workdir, container,
-             "timeout", "--signal=KILL", str(verifier_timeout), "bash", "/tests/test.sh"],
-            log_path, timeout=verifier_timeout + 15, output=verifier_log, check=False,
+             "timeout", "--signal=KILL", str(timeout),
+             "bash", "/tests/test.sh"],
+            log_path, timeout=timeout + 15, output=verifier_log, check=False,
         )
-    if verified.returncode not in (0, 1):
-        raise RuntimeError(f"官方判分进程异常退出，退出码 {verified.returncode}")
+    if test_result.returncode not in (0, 1):
+        raise RuntimeError(f"官方判分进程异常退出，退出码 {test_result.returncode}")
     reward = (verifier_logs / "reward.txt").read_text(encoding="utf-8").strip()
     if reward not in ("0", "1"):
         raise ValueError(f"官方判分产生无效 reward：{reward!r}")
-    if reward == "1" and verified.returncode != 0:
-        raise RuntimeError(f"官方 reward 与判分进程退出状态不一致：{reward=}, {verified.returncode=}")
-    return {"resolved": reward == "1", "verifier_returncode": verified.returncode}
+    if reward == "1" and test_result.returncode != 0:
+        raise RuntimeError(
+            f"官方 reward 与判分进程退出状态不一致："
+            f"{reward=}, {test_result.returncode=}"
+        )
+    return {
+        "resolved": reward == "1",
+        "verifier_returncode": test_result.returncode,
+    }

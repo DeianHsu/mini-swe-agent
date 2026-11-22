@@ -117,7 +117,10 @@ class ThinkingModeTests(unittest.TestCase):
     def test_invalid_prompt_usage_preserves_other_responses(self):
         trace_path = self.root / "trajectory.jsonl"
         mini_agent.record_event(trace_path, "start", {
-            "token_prices_per_million": {key: str(price) for key, price in cost.TOKEN_PRICES.items()},
+            "token_prices_per_million": {
+                key: str(price)
+                for key, price in cost.TOKEN_PRICES_PER_MILLION.items()
+            },
         })
         for step, prompt_tokens in enumerate((100, None, 100), start=1):
             mini_agent.record_event(trace_path, "request", {"step": step})

@@ -44,11 +44,11 @@ def write_report(run_dir: Path, verdicts: dict[str, bool | None] | None = None,
         result["resolved"] = resolved
         cases.append(result)
 
-    known_total = sum(
+    known_total_cost_usd = sum(
         (Decimal(case["known_cost_usd"]) for case in cases),
         Decimal("0"),
     )
-    complete = all(case["usage_complete"] for case in cases)
+    usage_complete = all(case["usage_complete"] for case in cases)
     passed = sum(case["resolved"] is True for case in cases)
     failed = sum(case["resolved"] is False for case in cases)
     ungraded = len(cases) - passed - failed
@@ -62,10 +62,12 @@ def write_report(run_dir: Path, verdicts: dict[str, bool | None] | None = None,
         "ungraded": ungraded,
         "evaluation_complete": ungraded == 0,
         "pass_at_1": passed / len(cases) if ungraded == 0 else None,
-        "total_cost_usd": str(known_total) if complete else None,
-        "known_total_cost_usd": str(known_total),
+        "total_cost_usd": (
+            str(known_total_cost_usd) if usage_complete else None
+        ),
+        "known_total_cost_usd": str(known_total_cost_usd),
         "known_total_tokens": sum(case["total_tokens"] or 0 for case in cases),
-        "usage_complete": complete,
+        "usage_complete": usage_complete,
     }
 
     (run_dir / "report.json").write_text(
@@ -80,7 +82,11 @@ def write_report(run_dir: Path, verdicts: dict[str, bool | None] | None = None,
         writer.writeheader()
         writer.writerows(cases)
     rate = f'{report["pass_at_1"]:.2%}' if report["evaluation_complete"] else "未完成，暂不发布最终通过率"
-    cost = f'${known_total}' if complete else f'未知；已记录 ${known_total}'
+    cost = (
+        f'${known_total_cost_usd}'
+        if usage_complete
+        else f'未知；已记录 ${known_total_cost_usd}'
+    )
     thinking_label = {None: "未记录", "disabled": "关闭", "max": "最高（max）"}[thinking_mode]
     (run_dir / "report.md").write_text(
         "# SWE-bench Pro V2 评测报告\n\n"

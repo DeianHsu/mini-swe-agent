@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 from textwrap import dedent
 
-from swe.cost import TOKEN_PRICES, read_reply_usage
+from swe.cost import TOKEN_PRICES_PER_MILLION, summarize_reply_usage
 from swe.environment import execute, limit_output
 from swe.use_llm import create_client, send_messages
 
@@ -105,7 +105,7 @@ def run_agent(task: str, *, container_name: str = "mini-swe-learning",
         "cost_limit_usd": str(cost_limit_usd),
         "thinking_mode": thinking_mode,
         "token_prices_per_million": {
-            key: str(value) for key, value in TOKEN_PRICES.items()
+            key: str(value) for key, value in TOKEN_PRICES_PER_MILLION.items()
         },
     })
 
@@ -127,7 +127,7 @@ def run_agent(task: str, *, container_name: str = "mini-swe-learning",
 
                 # 工具执行前先保存回复与用量，以便在命令失败后恢复费用。
                 record_event(trace_path, "assistant", {"step": model_calls, "message": message, **metadata})
-                _, reply_cost = read_reply_usage(metadata["usage"])
+                _, reply_cost = summarize_reply_usage(metadata["usage"])
                 total_cost += reply_cost
                 cost_known = True
 

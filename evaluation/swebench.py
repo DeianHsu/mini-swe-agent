@@ -117,13 +117,20 @@ def _read_agent_result(run_dir: Path, log_path: Path) -> dict:
     return result
 
 
-def _export_patch(case_dir: Path, image_id: str, workdir: str, limits: list[str],
-                  volume_name: str, capture_name: str) -> Path:
+def _export_patch(
+    case_dir: Path,
+    image_id: str,
+    workdir: str,
+    run_args: list[str],
+    volume_name: str,
+    capture_name: str,
+) -> Path:
     patch_path = case_dir / "model.patch"
     with patch_path.open("wb") as patch:
         verifier.run_command(
             ["docker", "run", "--rm", "--name", capture_name, "--network", "none",
-             *limits, "--mount", f"type=volume,source={volume_name},target=/candidate,readonly",
+             *run_args, "--mount",
+             f"type=volume,source={volume_name},target=/candidate,readonly",
              "--entrypoint", "bash", image_id, "-c", CAPTURE_SCRIPT, "capture", workdir, "/candidate"],
             case_dir / "runner.log", timeout=300, output=patch,
         )
@@ -168,7 +175,7 @@ def eval_case(dataset: Path, manifest: dict, index: int, output: Path) -> dict:
 
     try:
         config = tomllib.loads((task_dir / "task.toml").read_text(encoding="utf-8"))
-        limits = verifier.container_limits(config)
+        run_args = verifier.build_container_args(config)
         task_file = case_dir / "instruction.md"
         task_file.write_text((task_dir / "instruction.md").read_text(encoding="utf-8"), encoding="utf-8")
 
@@ -183,7 +190,7 @@ def eval_case(dataset: Path, manifest: dict, index: int, output: Path) -> dict:
         # 空卷由镜像中的仓库初始化；不挂载宿主机、测试目录或任何密钥。
         verifier.run_command(
             ["docker", "run", "-d", "--name", agent_name, "--network", "none",
-             *limits, "--env", "SDL_AUDIODRIVER=dummy",
+             *run_args, "--env", "SDL_AUDIODRIVER=dummy",
              "--mount", f"type=volume,source={volume_name},target={workdir}",
              "--entrypoint", "sleep", image_id, "infinity"], log_path,
             timeout=config["environment"]["build_timeout_sec"],
@@ -212,7 +219,9 @@ def eval_case(dataset: Path, manifest: dict, index: int, output: Path) -> dict:
         verifier.save_json(result_path, result)
         # 不恢复智能体容器；冻结工作区后交给干净镜像中的 Git 导出补丁。
         verifier.run_command(["docker", "stop", "--time", "0", agent_name], log_path)
-        patch_path = _export_patch(case_dir, image_id, workdir, limits, volume_name, capture_name)
+        patch_path = _export_patch(
+            case_dir, image_id, workdir, run_args, volume_name, capture_name
+        )
 
         result["stage"] = "verifier"
         verifier.save_json(result_path, result)
