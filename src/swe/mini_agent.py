@@ -11,18 +11,19 @@ from swe.cost import TOKEN_PRICES_PER_MILLION, summarize_reply_usage
 from swe.environment import execute, limit_output
 from swe.use_llm import create_client, send_messages
 
-
 # 为历史工具输出设置总字符上限，并用占位文本替换过早的大段输出。
 MAX_TOOL_HISTORY_CHARS = 256000
 OMITTED_OUTPUT = "[更早的命令输出已省略。需要时请缩小范围重新读取。]"
 
 
 # 原地压缩历史工具输出，保留消息顺序与工具调用标识之间的对应关系。
-def trim_tool_history(history: list[dict]) -> None:
+def _trim_tool_history(history: list[dict]) -> None:
     # 只处理含文本的工具消息，先限制每条输出的长度。
     tool_messages = [
-        message for message in history
-        if message.get("role") == "tool" and isinstance(message.get("content"), str)
+        message
+        for message in history
+        if message.get("role") == "tool"
+           and isinstance(message.get("content"), str)
     ]
     for message in tool_messages:
         message["content"] = limit_output(message["content"])
@@ -38,7 +39,7 @@ def trim_tool_history(history: list[dict]) -> None:
 
 
 def ask_model(client, task: str, history: list[dict], workdir: str, *,
-              thinking_mode: str) -> tuple[dict, dict]:
+              thinking_mode: str, on_retry=None) -> tuple[dict, dict]:
     """组装任务和历史消息并请求一轮模型回复。"""
     prompt = dedent(f"""
         你是一个编程智能体。
@@ -47,12 +48,18 @@ def ask_model(client, task: str, history: list[dict], workdir: str, *,
         每次调用启动独立进程，文件修改会保留。
         任务完成后，以普通文本回复 finish。
     """).strip()
-    messages = [{"role": "system", "content": prompt}, {"role": "user", "content": task}, *history]
-    return send_messages(client, messages, thinking_mode=thinking_mode)
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": task},
+        *history,
+    ]
+    return send_messages(
+        client, messages, thinking_mode=thinking_mode, on_retry=on_retry
+    )
 
 
 # 将运行事件按一行一条 JSON 的格式追加到轨迹文件，供后续恢复用量和排查问题。
-def record_event(path: Path | None, kind: str, data: dict) -> None:
+def _record_event(path: Path | None, kind: str, data: dict) -> None:
     # 未指定路径时不落盘；指定路径时每条事件写完即关闭文件，减少中断时的记录丢失。
     if path is not None:
         with path.open("a", encoding="utf-8", newline="\n") as handle:
@@ -64,7 +71,9 @@ def record_event(path: Path | None, kind: str, data: dict) -> None:
             )
 
 
-def _run_tool(tool_call: dict, *, container_name: str, workdir: str, timeout: int) -> str:
+def _run_tool(
+        tool_call: dict, *, container_name: str, workdir: str, timeout: int
+) -> str:
     """解析单次工具调用，将格式错误作为工具结果返回。"""
     function = tool_call["function"]
     if function["name"] != "execute":
@@ -78,13 +87,25 @@ def _run_tool(tool_call: dict, *, container_name: str, workdir: str, timeout: in
     command = arguments.get("command")
     if not isinstance(command, str):
         return "Error: command 必须是字符串"
-    return execute(command, container_name=container_name, workdir=workdir, timeout=timeout)
+    return execute(
+        command,
+        container_name=container_name,
+        workdir=workdir,
+        timeout=timeout,
+    )
 
 
-def run_agent(task: str, *, container_name: str = "mini-swe-learning",
-              workdir: str = "/workspace", timeout: int = 60,
-              max_steps: int = 250, cost_limit: float = 3.0,
-              trace_path: Path | None = None, thinking_mode: str = "disabled") -> dict:
+def run_agent(
+        task: str,
+        *,
+        container_name: str = "mini-swe-learning",
+        workdir: str = "/workspace",
+        timeout: int = 60,
+        max_steps: int = 250,
+        cost_limit: float = 3.0,
+        trace_path: Path | None = None,
+        thinking_mode: str = "disabled",
+) -> dict:
     """循环请求模型并执行工具，直到模型结束或用完轮数、费用预算。"""
     if max_steps < 1 or timeout <= 0 or cost_limit <= 0:
         raise ValueError("轮数、命令时限和费用阈值必须大于零")
@@ -94,10 +115,11 @@ def run_agent(task: str, *, container_name: str = "mini-swe-learning",
     cost_known = True
     cost_limit_usd = Decimal(str(cost_limit))
     model_calls = 0
+    transient_retries = 0
     exit_reason = "step_limit"
 
     # 保存本次任务、预算及实际采用的价目，使后续统计沿用本次运行的计价口径。
-    record_event(trace_path, "start", {
+    _record_event(trace_path, "start", {
         "task": task,
         "workdir": workdir,
         "max_steps": max_steps,
@@ -120,36 +142,74 @@ def run_agent(task: str, *, container_name: str = "mini-swe-learning",
                 # 发出请求前先将本轮费用标为未知，避免中断时把缺失消耗当作零。
                 model_calls += 1
                 cost_known = False
-                record_event(trace_path, "request", {"step": model_calls})
-                trim_tool_history(history)
-                message, metadata = ask_model(client, task, history, workdir, thinking_mode=thinking_mode)
+                _record_event(trace_path, "request", {"step": model_calls})
+                _trim_tool_history(history)
+
+                def _record_retry(
+                    attempt: int, error: Exception, delay: float
+                ) -> None:
+                    nonlocal transient_retries
+                    transient_retries += 1
+                    _record_event(
+                        trace_path,
+                        "retry",
+                        {
+                            "step": model_calls,
+                            "attempt": attempt,
+                            "error_type": type(error).__name__,
+                            "message": str(error),
+                            "delay_seconds": delay,
+                        },
+                    )
+
+                message, metadata = ask_model(
+                    client,
+                    task,
+                    history,
+                    workdir,
+                    thinking_mode=thinking_mode,
+                    on_retry=_record_retry,
+                )
                 history.append(message)
 
                 # 工具执行前先保存回复与用量，以便在命令失败后恢复费用。
-                record_event(trace_path, "assistant", {"step": model_calls, "message": message, **metadata})
+                _record_event(
+                    trace_path,
+                    "assistant",
+                    {"step": model_calls, "message": message, **metadata},
+                )
                 _, reply_cost = summarize_reply_usage(metadata["usage"])
                 total_cost += reply_cost
                 cost_known = True
 
                 tool_calls = message.get("tool_calls") or []
                 if not tool_calls:
-                    exit_reason = "finished" if metadata["finish_reason"] == "stop" else "model_incomplete"
+                    exit_reason = (
+                        "finished"
+                        if metadata["finish_reason"] == "stop"
+                        else "model_incomplete"
+                    )
                     break
 
                 for tool_call in tool_calls:
-                    tool_output = _run_tool(tool_call, container_name=container_name, workdir=workdir, timeout=timeout)
+                    tool_output = _run_tool(
+                        tool_call,
+                        container_name=container_name,
+                        workdir=workdir,
+                        timeout=timeout,
+                    )
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
                         "content": tool_output,
                     }
                     history.append(tool_message)
-                    record_event(trace_path, "tool", tool_message)
+                    _record_event(trace_path, "tool", tool_message)
 
     except Exception as error:
         # 记录本层无法恢复的异常，再向调用方抛出，避免把执行失败伪装成正常结束。
         exit_reason = "error"
-        record_event(trace_path, "error", {
+        _record_event(trace_path, "error", {
             "type": type(error).__name__,
             "message": str(error),
         })
@@ -160,10 +220,11 @@ def run_agent(task: str, *, container_name: str = "mini-swe-learning",
         summary = {
             "exit_reason": exit_reason,
             "model_calls": model_calls,
+            "transient_retries": transient_retries,
             "thinking_mode": thinking_mode,
             "budget_cost_usd": str(total_cost) if cost_known else None,
         }
-        record_event(trace_path, "end", summary)
+        _record_event(trace_path, "end", summary)
 
     # 将结束摘要与对话历史交给调用方，由调用方决定展示或保存哪些内容。
     return {**summary, "history": history}
