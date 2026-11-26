@@ -12,7 +12,12 @@ TOKEN_PRICES_PER_MILLION = {
     "prompt_cache_miss_tokens": Decimal("0.30"),
     "completion_tokens": Decimal("1.20"),
 }
-TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens")
+TOKEN_FIELDS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
+)
 
 
 def summarize_reply_usage(
@@ -26,9 +31,13 @@ def summarize_reply_usage(
     for field in TOKEN_FIELDS:
         count = usage[field]
         if type(count) is not int or count < 0:
-            raise ValueError(f"用量字段 {field} 必须是非负整数，收到 {count!r}")
+            raise ValueError(
+                f"用量字段 {field} 必须是非负整数，收到 {count!r}"
+            )
         tokens[field] = count
-    cost = sum(tokens[field] * price for field, price in prices.items()) / Decimal("1000000")
+    cost = sum(
+        tokens[field] * price for field, price in prices.items()
+    ) / Decimal("1000000")
     return tokens, cost
 
 
@@ -59,7 +68,9 @@ def read_run_usage(trace_path: Path) -> dict:
                     # 沿用运行时保存的价目，避免后来修改价格影响历史费用。
                     prices = {
                         key: Decimal(value)
-                        for key, value in data["token_prices_per_million"].items()
+                        for key, value in data[
+                            "token_prices_per_million"
+                        ].items()
                     }
 
                 elif event["kind"] == "request":

@@ -18,7 +18,9 @@ def write_report(run_dir: Path, verdicts: dict[str, bool | None] | None = None,
         raise ValueError("运行目录中没有题目记录")
 
     # 新运行记录模式；既有清单未记录时明确显示未知，不替历史结果推定模式。
-    thinking_mode = manifest.get("thinking_mode") if manifest is not None else None
+    thinking_mode = (
+        manifest.get("thinking_mode") if manifest is not None else None
+    )
     cases = []
     for instance_id in instance_ids:
         result_path = run_dir / instance_id / "agent_result.json"
@@ -29,14 +31,24 @@ def write_report(run_dir: Path, verdicts: dict[str, bool | None] | None = None,
         else:
             # 机器故障、取消或产物上传失败也必须留在本轮分母中。
             result = {
-                "status": "missing_result", "resolved": None,
-                "seconds": None, "model_calls": None,
-                "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
-                "known_cost_usd": "0", "budget_cost_usd": None, "usage_complete": False,
+                "status": "missing_result",
+                "resolved": None,
+                "seconds": None,
+                "model_calls": None,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "known_cost_usd": "0",
+                "budget_cost_usd": None,
+                "usage_complete": False,
                 "thinking_mode": thinking_mode,
             }
         # 缺少判分表示尚未得到结果，不能当作答错。
-        resolved = verdicts.get(instance_id) if verdicts is not None else result["resolved"]
+        resolved = (
+            verdicts.get(instance_id)
+            if verdicts is not None
+            else result["resolved"]
+        )
         if resolved is not None and type(resolved) is not bool:
             raise ValueError(f"{instance_id}: 判分必须是 true、false 或 null")
 
@@ -74,20 +86,46 @@ def write_report(run_dir: Path, verdicts: dict[str, bool | None] | None = None,
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    fields = ["instance_id", "thinking_mode", "seconds", "prompt_tokens", "completion_tokens", "total_tokens",
-              "budget_cost_usd", "known_cost_usd", "model_calls", "resolved", "usage_complete",
-              "status", "exit_reason", "stage", "error"]
-    with (run_dir / "report.csv").open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+    fields = [
+        "instance_id",
+        "thinking_mode",
+        "seconds",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "budget_cost_usd",
+        "known_cost_usd",
+        "model_calls",
+        "resolved",
+        "usage_complete",
+        "status",
+        "exit_reason",
+        "stage",
+        "error",
+    ]
+    with (run_dir / "report.csv").open(
+        "w", encoding="utf-8-sig", newline=""
+    ) as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=fields, extrasaction="ignore"
+        )
         writer.writeheader()
         writer.writerows(cases)
-    rate = f'{report["pass_at_1"]:.2%}' if report["evaluation_complete"] else "未完成，暂不发布最终通过率"
+    rate = (
+        f'{report["pass_at_1"]:.2%}'
+        if report["evaluation_complete"]
+        else "未完成，暂不发布最终通过率"
+    )
     cost = (
         f'${known_total_cost_usd}'
         if usage_complete
         else f'未知；已记录 ${known_total_cost_usd}'
     )
-    thinking_label = {None: "未记录", "disabled": "关闭", "max": "最高（max）"}[thinking_mode]
+    thinking_label = {
+        None: "未记录",
+        "disabled": "关闭",
+        "max": "最高（max）",
+    }[thinking_mode]
     (run_dir / "report.md").write_text(
         "# SWE-bench Pro V2 评测报告\n\n"
         f"| 项目 | 结果 |\n|---|---|\n| 计划题数 | {len(cases)} |\n"
@@ -109,10 +147,29 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", type=Path)
     args = parser.parse_args()
 
-    verdicts = json.loads(args.verdicts.read_text(encoding="utf-8")) if args.verdicts else None
-    manifest = json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest else None
+    verdicts = (
+        json.loads(args.verdicts.read_text(encoding="utf-8"))
+        if args.verdicts
+        else None
+    )
+    manifest = (
+        json.loads(args.manifest.read_text(encoding="utf-8"))
+        if args.manifest
+        else None
+    )
     report = write_report(args.run_dir, verdicts, manifest=manifest)
-    print(json.dumps({key: value for key, value in report.items() if key not in ("cases", "manifest")},
-                     ensure_ascii=False, indent=2))
-    if manifest is not None and (not report["evaluation_complete"] or not report["usage_complete"]):
+    print(
+        json.dumps(
+            {
+                key: value
+                for key, value in report.items()
+                if key not in ("cases", "manifest")
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    if manifest is not None and (
+        not report["evaluation_complete"] or not report["usage_complete"]
+    ):
         sys.exit(1)

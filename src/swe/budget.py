@@ -15,7 +15,7 @@ from swe.cost import read_run_usage
 TASK_TIMEOUT_SECONDS = 3000
 
 
-def write_json(path: Path, data: dict) -> None:
+def _write_json(path: Path, data: dict) -> None:
     """先写同目录的临时文件，再替换目标文件，避免读取方看到半份 JSON。"""
     temporary = path.with_suffix(".tmp")
     temporary.write_text(
@@ -26,7 +26,7 @@ def write_json(path: Path, data: dict) -> None:
 
 
 # 在工作子进程中读取运行参数、执行智能体，并保存智能体的结束摘要。
-def run_worker(run_dir: Path) -> None:
+def _run_worker(run_dir: Path) -> None:
     result_path = run_dir / "agent_result.json"
     try:
         # 只有实际解题的子进程才加载模型依赖。
@@ -45,7 +45,7 @@ def run_worker(run_dir: Path) -> None:
         )
     except Exception as error:
         try:
-            write_json(result_path, {
+            _write_json(result_path, {
                 "exit_reason": "error",
                 "error_type": type(error).__name__,
                 "error": str(error),
@@ -56,7 +56,7 @@ def run_worker(run_dir: Path) -> None:
 
     # 对话已经逐条保存在轨迹中，结果文件只保留摘要，避免重复写入大段历史。
     result.pop("history")
-    write_json(result_path, result)
+    _write_json(result_path, result)
 
 
 def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
@@ -93,7 +93,7 @@ def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
     # 每次使用独立目录，禁止覆盖已经开始过的尝试。
     run_dir.mkdir(parents=True, exist_ok=False)
     # 固定本次任务的输入和预算，供工作进程读取并留作后续检查。
-    write_json(run_dir / "case.json", {
+    _write_json(run_dir / "case.json", {
         "task": task,
         "container": container,
         "workdir": workdir,
@@ -171,7 +171,7 @@ def run_with_budget(task: str, container: str, workdir: str, run_dir: Path, *,
     # 即使工作进程超时或失败，结果也保留本次实际采用的思考模式。
     result["thinking_mode"] = thinking_mode
     result["cleanup_error"] = cleanup_error
-    write_json(result_path, result)
+    _write_json(result_path, result)
 
     # 落盘后再报告错误，启动失败时保留原始异常。
     if startup_error is not None:
@@ -190,12 +190,14 @@ def main() -> None:
     parser.add_argument("--container")
     parser.add_argument("--workdir", default="/app")
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--thinking-mode", choices=("disabled", "max"), default="disabled")
+    parser.add_argument(
+        "--thinking-mode", choices=("disabled", "max"), default="disabled"
+    )
     args = parser.parse_args()
 
     # 内部工作进程直接读取已有目录开始解题，避免再次启动一层监管进程。
     if args.worker is not None:
-        run_worker(args.worker)
+        _run_worker(args.worker)
         return
 
     # 普通调用必须提供任务文件、已有容器和输出目录，缺失时由参数解析器报错。

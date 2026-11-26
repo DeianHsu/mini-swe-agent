@@ -58,7 +58,7 @@
 
 题号 259、580、588（从 0 开始）发生连接被对端重置（`Connection reset by peer`），各缺少 1 次请求的用量，判分依次为未通过、未通过、通过。
 
-[报告任务](https://github.com/DeianHsu/demo-mini-swe-agent/actions/runs/43650570228/job/132779752980)因用量记录缺失返回退出码 1，GitHub 显示红叉；报告产物已上传。
+[报告任务](https://github.com/DeianHsu/mini-swe-agent/actions/runs/43650570228/job/132779752980)因用量记录缺失返回退出码 1，GitHub 显示红叉；报告产物已上传。
 
 ## 六、结论
 
@@ -68,7 +68,7 @@
 
 ## 七、数据来源
 
-- [GitHub 运行 43650570228](https://github.com/DeianHsu/demo-mini-swe-agent/actions/runs/43650570228)：工作流时间记录；报告产物 `swebench-report`，单题产物 `swebench-case-题号`。
-- [report.csv](https://github.com/DeianHsu/demo-mini-swe-agent/blob/master/reports/43650570228/report.csv)：逐题用时、词元、费用、轮数和判分。
-- [report.json](https://github.com/DeianHsu/demo-mini-swe-agent/blob/master/reports/43650570228/report.json)：完整统计及异常状态。
-- [manifest.json](https://github.com/DeianHsu/demo-mini-swe-agent/blob/master/reports/43650570228/manifest.json)：题目清单、预算和版本。
+- [GitHub 运行 43650570228](https://github.com/DeianHsu/mini-swe-agent/actions/runs/43650570228)：工作流时间记录；报告产物 `swebench-report`，单题产物 `swebench-case-题号`。
+- [report.csv](https://github.com/DeianHsu/mini-swe-agent/blob/master/reports/43650570228/report.csv)：逐题用时、词元、费用、轮数和判分。
+- [report.json](https://github.com/DeianHsu/mini-swe-agent/blob/master/reports/43650570228/report.json)：完整统计及异常状态。
+- [manifest.json](https://github.com/DeianHsu/mini-swe-agent/blob/master/reports/43650570228/manifest.json)：题目清单、预算和版本。

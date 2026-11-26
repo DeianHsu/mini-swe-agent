@@ -28,7 +28,11 @@ def _read_output_sample(stream: BinaryIO) -> str:
     if size > sample_bytes:
         stream.seek(max(sample_bytes, size - sample_bytes))
         data += stream.read(sample_bytes)
-    return data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    return (
+        data.decode("utf-8", errors="replace")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
 
 
 def execute(command: str, *, container_name: str = "mini-swe-learning",
@@ -46,7 +50,11 @@ def execute(command: str, *, container_name: str = "mini-swe-learning",
     with TemporaryFile() as stdout, TemporaryFile() as stderr:
         try:
             result = subprocess.run(
-                args=args, stdout=stdout, stderr=stderr, timeout=timeout + 15, check=False,
+                args=args,
+                stdout=stdout,
+                stderr=stderr,
+                timeout=timeout + 15,
+                check=False,
             )
         except subprocess.TimeoutExpired as error:
             # 宿主进程额外等待 15 秒。超时后由预算监管流程停止容器。

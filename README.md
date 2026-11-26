@@ -1,44 +1,72 @@
-# mini-swe-agent-demo
+# mini-swe-agent
 
-一个参考 [mini-SWE-agent](https://github.com/SWE-agent/mini-swe-agent) 手写的 Python 智能体（Agent）学习项目。
+基于原生函数调用（Function Calling）和 Docker 隔离沙箱的轻量级代码修复智能体（Agent）。  
+参考 [mini-SWE-agent](https://github.com/SWE-agent/mini-swe-agent) 架构，核心运行仅依赖 `openai` 与 `python-dotenv`。模型在隔离容器内通过 Bash 读取代码、修改文件并运行测试，程序负责上下文裁剪、超时与费用控制、瞬时网络故障重试及运行轨迹记录。
 
-模型通过原生函数调用（Function Calling）提交 Bash 命令，在 Docker 容器中读取文件、修改代码和运行测试。程序将执行结果写回消息历史，驱动下一轮操作。
+入口：[核心能力](#核心能力) · [评测基线](#评测基线) · [快速开始](#快速开始) · [单元测试](#单元测试)
 
-## 功能
+## 核心能力
 
-- 单一工具 `execute`：解析 `tool_calls` 中的 `command`，交给容器中的 `bash -c` 执行。
-- 工具结果通过关联 `tool_call_id` 的 `tool` 消息反馈给模型。
-- 模型停止工具调用后结束，默认最多调用模型 250 轮，单条命令执行上限 60 秒。
-- 由 `budget.py` 监管每题 50 分钟时限，费用阈值为 3 美元；`cost.py` 负责词元和费用统计。
-- 默认关闭思考；预算入口可用 `--thinking-mode max` 启用最高档，模式随轨迹和结果保存。
-- 单次命令输出最多 16,000 字符，工具历史正文累计最多 256,000 字符；截断时保留调用对应关系。
+- **原生 Tool-Use 循环与上下文控制**：通过单一 `execute` 工具提交容器内 Bash 命令，将退出码、STDOUT 与 STDERR 写回关联 `tool_call_id` 的 `tool` 消息驱动多轮排错。单次命令输出经临时文件首尾采样截断至 16,000 字符（防止单次大日志占用过多内存与上下文），工具历史按 256,000 字符滑动裁剪并保留调用配对完整性。
+- **沙箱隔离与预算控制**：容器启用 `--network none` 与 CPU/内存限额，单条命令由容器内 `timeout --signal=KILL` 限制（默认 60 秒）；`budget.py` 通过独立工作子进程配合单调时钟监管整体时限（50 分钟）、轮数上限（250 轮）和费用阈值（3 美元），原子写入结果并在结束或异常时强制停止容器。
+- **显式故障重试与透明记账**：关闭 SDK 内部重试（`max_retries=0`），在调用层针对连接重置、超时、429 与 5xx 瞬时故障执行最多 3 次指数退避重试（`1s → 2s → 4s`）。所有请求、重试、模型回复与工具输出逐行写入 `trajectory.jsonl`，超时或中断后仍可从轨迹恢复已知词元与费用。
+
+```mermaid
+flowchart TB
+    Input["输入：任务描述 + 断网 Docker 容器"] --> AgentLoop
+
+    subgraph AgentLoop["Agent 核心闭环（mini_agent.py）"]
+        direction TB
+        Context["上下文与消息历史<br/>256K 滑动裁剪 · 保留 tool_call_id 配对"]
+        LLM["大模型决策（use_llm.py）<br/>原生 Function Calling · 显式退避重试"]
+        Check{"是否发起<br/>tool_calls?"}
+        Exec["Docker 沙箱执行（environment.py）<br/>Bash 读码 / 改码 / 跑单测<br/>60s 超时强杀 · 16K 首尾截断"]
+
+        Context --> LLM --> Check
+        Check -->|"execute(command)"| Exec
+        Exec -->|"Exit code / STDOUT / STDERR"| Context
+    end
+
+    Guard["运行监管（budget.py / cost.py）<br/>250 轮上限 · 3 美元阈值 · 50min 时限 · JSONL 轨迹"] -.->|"监管与记账"| AgentLoop
+    Check -->|"无工具调用（finish）"| Output["输出：容器内代码修改 + 轨迹与成本统计<br/>停止并回收任务容器"]
+```
+
+## 评测基线
+
+在 [scaleapi/SWE-bench_Pro-os](https://github.com/scaleapi/SWE-bench_Pro-os) 全量 642 题上完成基线验证（`deepseek-flash` 关闭思考，8 并发），完整明细见 [2026-11-15 全量评测报告](https://github.com/DeianHsu/mini-swe-agent/blob/master/reports/43650570228/report.md)。
+
+| 指标 | 实测结果 |
+| --- | --- |
+| 首次尝试通过率（pass@1） | **87.38%**（**561 / 642** 题通过） |
+| 单题平均用时 / 平均轮数 | **3 分 56 秒** / **32.01 轮**（共 20,553 次请求） |
+| Prompt Cache 命中率 | **97.34%**（527.6M / 542.0M 输入词元） |
+| 完整样本平均费用 | 约 **0.02 美元/题**（已记录总费用 12.639 美元） |
+
+> 评测复盘：全量 2 万余次请求中出现 3 例对端连接重置（`Connection reset by peer`），随后在 `use_llm.py` 调用层补充了针对瞬时故障的显式指数退避重试与 `retry` 轨迹审计。
 
 ## 项目结构
 
 ```text
-src/
-└── swe/
-    ├── __init__.py
-    ├── mini_agent.py        # 消息历史、工具调度与智能体循环
-    ├── environment.py       # Docker Bash 命令执行与输出截断
-    ├── use_llm.py           # 模型请求与原生函数调用定义
-    ├── budget.py            # 预算监管与运行结果保存
-    └── cost.py              # 词元与费用统计
+src/swe/
+├── mini_agent.py        # 智能体主循环、历史裁剪、工具调度与轨迹记录
+├── environment.py       # Docker 容器 Bash 执行、超时强杀与首尾采样截断
+├── use_llm.py           # OpenAI SDK 封装、原生函数调用与显式退避重试
+├── budget.py            # 子进程时限监管、原子落盘、容器停止与用量恢复
+└── cost.py              # 词元与美元费用统计、轨迹断点用量恢复
+evaluation/              # SWE-bench Pro V2 判分校准、全量调度与报告汇总
+tests/                   # 离线单元测试
+.github/workflows/       # GitHub Actions 校准与全量评测工作流
 ```
-
-`ask_model()` 组织提示与消息历史，`run_agent()` 控制循环并调度工具，`execute()` 执行命令并返回退出码、标准输出和标准错误。每次命令启动独立进程，容器内文件修改会保留，跨次调用的 `cd` 和环境变量设置不会保留。
 
 ## 安装与配置
 
-需要 Python 3.14+、uv 和运行中的 Docker Linux 引擎。Windows 可使用 Docker Desktop。
-
-在项目根目录安装依赖：
+需要 **Python 3.14+**、**uv** 与运行中的 Docker Linux 引擎（Windows 可用 Docker Desktop）。
 
 ```powershell
 uv sync
 ```
 
-在根目录创建 `.env`，填写模型服务配置：
+在项目根目录创建 `.env`：
 
 ```dotenv
 DEEPSEEK_API_KEY=你的密钥
@@ -46,52 +74,46 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-flash
 ```
 
-模型接口通过 OpenAI Python 软件开发工具包（SDK）调用。当前请求使用 DeepSeek 的 `thinking` 参数，服务需要支持 `tools`。`.env` 已加入 Git 忽略规则。
+## 快速开始
 
-## 运行示例
+以下命令在项目根目录 PowerShell 中执行。
 
-以下命令均在项目根目录的 PowerShell 中执行，运行时会调用配置的模型服务。
-
-首次创建示例容器并准备文件：
+1. 启动断网且限额的目标容器（将待修复代码放入 `/workspace`）：
 
 ```powershell
-docker run -d --name mini-swe-learning -w /workspace python:3.14-slim sleep infinity
-docker exec -w /workspace mini-swe-learning bash -c 'echo Hello Agent! > hello.txt'
+docker run -d --name mini-swe-sandbox --network none --cpus 1 --memory 4g -w /workspace python:3.14-slim sleep infinity
 ```
 
-容器运行后启动智能体：
+2. 将问题描述写入 UTF-8 文件 `task.md`，通过预算监管入口启动智能体（可用 `--thinking-mode max` 开启最高思考档）：
 
 ```powershell
-uv run python -m swe.mini_agent
+uv run python -m swe.budget --task-file task.md --container mini-swe-sandbox --workdir /workspace --output "archive/manual/$(Get-Date -Format yyyyMMdd-HHmmss)"
 ```
 
-默认任务列出工作目录并读取 `hello.txt`。任务位于 `src/swe/mini_agent.py` 的 `if __name__ == "__main__":` 中；演示通过 `budget.run_with_budget()` 执行，预算在 `src/swe/budget.py` 中设置。轨迹与统计写入本地 `archive/demo/`，结束后停止本题容器。
+运行结果保存在指定输出目录：
+- `case.json`：任务、预算配置与思考模式；
+- `trajectory.jsonl`：逐轮请求、重试、模型回复及工具执行轨迹；
+- `agent_result.json`：用时、轮数、词元、估算费用与结束原因；
+- `agent.log`：运行日志。
 
-已有容器停止后可通过 `docker start mini-swe-learning` 再次启动。
+## 单元测试
 
-## 测试
-
-保留的离线测试覆盖命令输出限制、镜像工具路径，以及评测预算校验、补丁回放、校准和报告汇总；不调用模型或启动真实评测容器：
+离线运行，不调用外部模型接口，也不启动真实评测容器：
 
 ```powershell
 uv run python -m unittest discover -s tests -v
 uv run python -m unittest discover -s evaluation -v
 ```
 
-## 独立评测
+<details>
+<summary>独立评测流水线（GitHub Actions 校准与全量评测，点击展开）</summary>
 
-`evaluation/` 与主线分离，通过命令行和 JSON 产物衔接；工作流均由 GitHub 网页端手动触发，推送代码不会自动开始评测。
+[评测代码](https://github.com/DeianHsu/mini-swe-agent/tree/master/evaluation)与 Agent 主线通过命令行和 JSON 产物解耦，工作流配置保存在 [.github/workflows/](https://github.com/DeianHsu/mini-swe-agent/tree/master/.github/workflows)：
 
-- **SWE-bench Pro V2 小规模判分校准**：填写官方 `v2/tasks/` 下的单题目录名 `instance_id`，分别验证空补丁失败、参考补丁通过。不需要模型密钥，产物名为 `swebench-calibration`。
-- **SWE-bench Pro V2 全量评测**：每轮固定 642 题，每题解题一次，在新容器中判分。需配置仓库机密 `DEEPSEEK_API_KEY`，最终报告产物名为 `swebench-report`。
-- **SWE-bench Pro V2 全量评测（最高思考）**：独立手动入口 `evaluate_all_max.yml`，固定启用 `thinking.type=enabled` 和 `reasoning_effort=max`，使用相同密钥、模型、题目、预算及 120 秒客户端超时。最终报告产物名为 `swebench-report-max`。
+- **[判分校准](https://github.com/DeianHsu/mini-swe-agent/actions/workflows/evaluate_calibration.yml)**：验证单题空补丁失败、参考补丁通过（0 次模型调用）。
+- **[全量评测（默认关闭思考）](https://github.com/DeianHsu/mini-swe-agent/actions/workflows/evaluate_all.yml)**：3 批次共 642 题，每题在全新容器中独立判分并汇总成本报告。
+- **[全量评测（最高思考）](https://github.com/DeianHsu/mini-swe-agent/actions/workflows/evaluate_all_max.yml)**：启用 `thinking.type=enabled` 与 `reasoning_effort=max`，沿用相同题目与预算配置。
 
-校准入口为 `evaluation/calibrate.py`，全量入口为 `evaluation/swebench.py`。两者只共用评测层的 `verifier.py`，校准结果不计入全量成绩。报告包含思考模式、每题用时、词元消耗、费用、轮数、是否做对以及总成本；判分完整时发布通过率，用量完整时发布完整总费用。
-
-最高思考入口复用全量调度，每轮单独生成清单和产物；普通全量入口始终默认关闭思考。带工具调用的思考回复会完整保留并回传 `reasoning_content`，费用仍按服务端 `usage` 中的总输出词元计算，不重复加算思考词元。
+</details>
 
 本地 `archive/`、`.env`、虚拟环境和编辑器配置均不纳入版本控制。
-
-## 评测报告
-
-- [2026-11-15：关闭思考模式的全量评测报告](https://github.com/DeianHsu/demo-mini-swe-agent/blob/master/reports/43650570228/report.md)
